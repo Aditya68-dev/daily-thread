@@ -1,15 +1,13 @@
-import { initializeApp } from 'firebase/app';
-import { getAuth, GoogleAuthProvider, signInWithPopup, signOut } from 'firebase/auth';
-import { auth as configuredAuth, googleProvider as configuredProvider } from './firebase.js';
+import { onAuthStateChanged, signInWithPopup, signOut } from 'firebase/auth';
+import { auth, googleProvider } from './firebase.js';
 
-export const auth = configuredAuth;
-export const googleProvider = configuredProvider;
+export { auth, googleProvider, onAuthStateChanged };
 
 export const loginWithGoogle = async () => {
   const result = await signInWithPopup(auth, googleProvider);
   return result.user;
 };
 
-export const logoutUser = () => signOut(auth);
-
-export { onAuthStateChanged } from 'firebase/auth';
+export const logoutUser = async () => {
+  await signOut(auth);
+};
