@@ -1,0 +1,36 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return signedIn() && (
+        request.auth.token.admin == true ||
+        request.auth.token.role == 'admin'
+      );
+    }
+
+    function ownsExistingOrder() {
+      return signedIn() && resource.data.userId == request.auth.uid;
+    }
+
+    function ownsNewOrder() {
+      return signedIn() && request.resource.data.userId == request.auth.uid;
+    }
+
+    match /orders/{orderId} {
+      // Customers can only read their own orders. Admin access must be granted
+      // with a Firebase custom claim; a localStorage role is not trusted here.
+      allow read: if isAdmin() || ownsExistingOrder();
+      allow create: if isAdmin() || ownsNewOrder();
+      allow update: if isAdmin() || (
+        ownsExistingOrder() &&
+        request.resource.data.userId == resource.data.userId
+      );
+      allow delete: if isAdmin();
+    }
+  }
+}

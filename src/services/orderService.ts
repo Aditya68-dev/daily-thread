@@ -1,17 +1,27 @@
 import { supabase, isSupabaseConfigured } from '../lib/supabase.ts';
+import { db } from '../firebase.js';
+import {
+  collection,
+  doc,
+  getDocs,
+  orderBy,
+  query,
+  setDoc,
+  updateDoc,
+  where
+} from 'firebase/firestore';
 import { Order, OrderStatus } from '../types.ts';
 import { productService } from './productService.ts';
-import { SEED_ORDERS } from '../data/initialData.ts';
 
 const LOCAL_ORDERS_KEY = 'dt_local_orders';
 const RESET_FLAG_KEY = 'dt_orders_reset_fresh_v3';
 
 function getStoredOrders(): Order[] {
   try {
+    // Never clear existing local orders merely because this browser has no flag yet.
+    // The flag is retained for backward compatibility with older installations.
     if (localStorage.getItem(RESET_FLAG_KEY) !== 'true') {
-      localStorage.setItem(LOCAL_ORDERS_KEY, JSON.stringify([]));
       localStorage.setItem(RESET_FLAG_KEY, 'true');
-      return [];
     }
     const raw = localStorage.getItem(LOCAL_ORDERS_KEY);
     if (raw) {
@@ -19,14 +29,102 @@ function getStoredOrders(): Order[] {
       if (Array.isArray(parsed)) return parsed;
     }
   } catch (e) {
-    console.error(e);
+    console.error('Failed to read local orders:', e);
   }
-  localStorage.setItem(LOCAL_ORDERS_KEY, JSON.stringify([]));
   return [];
 }
 
 function saveStoredOrders(orders: Order[]) {
-  localStorage.setItem(LOCAL_ORDERS_KEY, JSON.stringify(orders));
+  try {
+    localStorage.setItem(LOCAL_ORDERS_KEY, JSON.stringify(orders));
+  } catch (e) {
+    console.error('Failed to save local orders:', e);
+  }
+}
+
+function orderFromFirestore(data: any): Order {
+  return {
+    ...data,
+    id: data.id,
+    userId: data.userId,
+    orderNumber: data.orderNumber,
+    items: data.items || [],
+    status: data.status as OrderStatus,
+    createdAt: typeof data.createdAt?.toDate === 'function'
+      ? data.createdAt.toDate().toISOString()
+      : data.createdAt
+  } as Order;
+}
+
+function orderToFirestore(order: Order): Record<string, unknown> {
+  // The UID is deliberately stored in the document, not inferred from email/phone.
+  return { ...order, userId: order.userId };
+}
+
+async function saveOrderToFirestore(order: Order): Promise<void> {
+  await setDoc(doc(db, 'orders', order.id), orderToFirestore(order), { merge: false });
+}
+
+async function migrateLocalOrders(userId: string, userEmail?: string): Promise<Order[]> {
+  const cleanEmail = (userEmail || '').trim().toLowerCase();
+  const localOrders = getStoredOrders();
+  const eligible = localOrders.filter(order =>
+    order.userId === userId ||
+    (!order.userId && cleanEmail && order.customerEmail?.trim().toLowerCase() === cleanEmail)
+  );
+
+  for (const order of eligible) {
+    const migratedOrder = { ...order, userId };
+    try {
+      // setDoc with merge preserves any cloud fields already present and is idempotent.
+      await setDoc(doc(db, 'orders', order.id), orderToFirestore(migratedOrder), { merge: true });
+    } catch (error) {
+      console.warn(`Firestore migration skipped for order ${order.id}:`, error);
+    }
+  }
+  // Do not remove or rewrite local orders during migration.
+  return eligible.map(order => order.userId === userId ? order : { ...order, userId });
+}
+
+function mergeOrders(...lists: Order[][]): Order[] {
+  const byId = new Map<string, Order>();
+  lists.flat().forEach(order => {
+    if (order?.id && !byId.has(order.id)) byId.set(order.id, order);
+  });
+  return [...byId.values()].sort((a, b) =>
+    new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+  );
+}
+
+function mapSupabaseOrder(o: any): Order {
+  return {
+    id: o.id,
+    orderNumber: o.order_number,
+    userId: o.user_id,
+    customerName: o.customer_name,
+    customerPhone: o.customer_phone,
+    customerEmail: o.customer_email,
+    shippingAddress: o.shipping_address,
+    district: o.district,
+    city: o.city,
+    province: o.province,
+    postalCode: o.postal_code,
+    notes: o.notes,
+    shippingMethod: o.shipping_method,
+    shippingCost: o.shipping_cost,
+    subtotal: o.subtotal,
+    grandTotal: o.grand_total,
+    status: o.status as OrderStatus,
+    items: o.items || [],
+    whatsappText: o.whatsapp_text,
+    snapToken: o.snap_token || o.snapToken || '',
+    snapRedirectUrl: o.snap_redirect_url || o.snapRedirectUrl || '',
+    paymentMethod: o.payment_method || 'Midtrans',
+    paymentTime: o.payment_time,
+    trackingNumber: o.tracking_number,
+    courier: o.courier,
+    createdAt: o.created_at
+  };
 }
 
 export const orderService = {
@@ -64,6 +162,8 @@ Halo Admin Daily Thread, saya ingin mengonfirmasi pesanan di atas. Mohon info no
   },
 
   async createOrder(orderData: any, userId?: string): Promise<{ order: Order; whatsappUrl: string }> {
+    if (!userId) throw new Error('Silakan login dengan Google sebelum membuat pesanan.');
+
     const orderNumber = orderData.orderNumber || `DT-ORD-${Date.now()}`;
     const newOrder: Order = {
       id: orderData.id || `ord-${Date.now()}`,
@@ -93,169 +193,88 @@ Halo Admin Daily Thread, saya ingin mengonfirmasi pesanan di atas. Mohon info no
     };
 
     newOrder.whatsappText = this.buildWhatsAppMessage(newOrder);
-
     const config = productService.getStoreConfig();
     const cleanPhone = String(config.whatsappNumber).replace(/[^0-9]/g, '');
     const whatsappUrl = `https://wa.me/${cleanPhone}?text=${encodeURIComponent(newOrder.whatsappText)}`;
 
-    // Save to Supabase if configured
+    try {
+      await saveOrderToFirestore(newOrder);
+    } catch (error) {
+      console.warn('Firestore order insert warning; retaining local fallback:', error);
+    }
+
     if (isSupabaseConfigured) {
       try {
         const { error } = await supabase.from('orders').insert({
-          id: newOrder.id,
-          order_number: newOrder.orderNumber,
-          user_id: userId,
-          customer_name: newOrder.customerName,
-          customer_phone: newOrder.customerPhone,
-          customer_email: newOrder.customerEmail,
-          shipping_address: newOrder.shippingAddress,
-          district: newOrder.district,
-          city: newOrder.city,
-          province: newOrder.province,
-          postal_code: newOrder.postalCode,
-          notes: newOrder.notes,
-          shipping_method: newOrder.shippingMethod,
-          shipping_cost: newOrder.shippingCost,
-          subtotal: newOrder.subtotal,
-          grand_total: newOrder.grandTotal,
-          status: newOrder.status,
-          whatsapp_text: newOrder.whatsappText,
-          snap_token: newOrder.snapToken,
-          snap_redirect_url: newOrder.snapRedirectUrl,
-          items: newOrder.items
+          id: newOrder.id, order_number: newOrder.orderNumber, user_id: userId,
+          customer_name: newOrder.customerName, customer_phone: newOrder.customerPhone,
+          customer_email: newOrder.customerEmail, shipping_address: newOrder.shippingAddress,
+          district: newOrder.district, city: newOrder.city, province: newOrder.province,
+          postal_code: newOrder.postalCode, notes: newOrder.notes,
+          shipping_method: newOrder.shippingMethod, shipping_cost: newOrder.shippingCost,
+          subtotal: newOrder.subtotal, grand_total: newOrder.grandTotal, status: newOrder.status,
+          whatsapp_text: newOrder.whatsappText, snap_token: newOrder.snapToken,
+          snap_redirect_url: newOrder.snapRedirectUrl, items: newOrder.items
         });
-
-        if (error) {
-          console.warn('Supabase order insert warning:', error);
-        }
+        if (error) console.warn('Supabase order insert warning:', error);
       } catch (err) {
         console.warn('Supabase createOrder error, saved locally:', err);
       }
     }
 
-    // Save locally
     const orders = getStoredOrders();
-    // Prevent duplicate orders in local storage
-    const filteredOrders = orders.filter(o => o.id !== newOrder.id && o.orderNumber !== newOrder.orderNumber);
-    saveStoredOrders([newOrder, ...filteredOrders]);
-
+    saveStoredOrders([newOrder, ...orders.filter(o => o.id !== newOrder.id && o.orderNumber !== newOrder.orderNumber)]);
     return { order: newOrder, whatsappUrl };
   },
 
   async getUserOrders(userId?: string, userEmail?: string, userPhone?: string): Promise<Order[]> {
-    const cleanEmail = (userEmail || '').trim().toLowerCase();
-    const cleanPhone = (userPhone || '').replace(/[^0-9]/g, '');
+    if (!userId) return [];
+    let cloudOrders: Order[] = [];
+    try {
+      const snapshot = await getDocs(query(
+        collection(db, 'orders'),
+        where('userId', '==', userId),
+        orderBy('createdAt', 'desc')
+      ));
+      cloudOrders = snapshot.docs.map(item => orderFromFirestore(item.data()));
+    } catch (error) {
+      console.warn('Firestore fetch user orders fallback:', error);
+    }
 
-    if (isSupabaseConfigured && (userId || cleanEmail)) {
+    const migrated = await migrateLocalOrders(userId, userEmail);
+    const localOrders = getStoredOrders().filter(order =>
+      order.userId === userId ||
+      (!order.userId && userEmail && order.customerEmail?.trim().toLowerCase() === userEmail.trim().toLowerCase())
+    );
+
+    // Supabase remains a compatibility source, but Firebase UID is the primary key.
+    let supabaseOrders: Order[] = [];
+    if (isSupabaseConfigured) {
       try {
-        let query = supabase.from('orders').select('*');
-        if (userId && cleanEmail) {
-          query = query.or(`user_id.eq.${userId},customer_email.ilike.${cleanEmail}`);
-        } else if (userId) {
-          query = query.eq('user_id', userId);
-        } else if (cleanEmail) {
-          query = query.ilike('customer_email', cleanEmail);
-        }
-        const { data, error } = await query.order('created_at', { ascending: false });
-
-        if (!error && data && data.length > 0) {
-          return data.map((o: any) => ({
-            id: o.id,
-            orderNumber: o.order_number,
-            userId: o.user_id,
-            customerName: o.customer_name,
-            customerPhone: o.customer_phone,
-            customerEmail: o.customer_email,
-            shippingAddress: o.shipping_address,
-            district: o.district,
-            city: o.city,
-            province: o.province,
-            postalCode: o.postal_code,
-            notes: o.notes,
-            shippingMethod: o.shipping_method,
-            shippingCost: o.shipping_cost,
-            subtotal: o.subtotal,
-            grandTotal: o.grand_total,
-            status: o.status as OrderStatus,
-            items: o.items || [],
-            whatsappText: o.whatsapp_text,
-            snapToken: o.snap_token || o.snapToken || '',
-            snapRedirectUrl: o.snap_redirect_url || o.snapRedirectUrl || '',
-            paymentMethod: o.payment_method || 'Midtrans',
-            createdAt: o.created_at
-          }));
-        }
-      } catch (err) {
-        console.warn('Supabase fetch user orders fallback:', err);
+        const { data, error } = await supabase.from('orders').select('*').eq('user_id', userId).order('created_at', { ascending: false });
+        if (!error && data) supabaseOrders = data.map(mapSupabaseOrder);
+      } catch (error) {
+        console.warn('Supabase fetch user orders fallback:', error);
       }
     }
-
-    const all = getStoredOrders();
-    let hasUpdates = false;
-
-    const userOrders = all.filter(o => {
-      const matchId = Boolean(userId && o.userId === userId);
-      const matchEmail = Boolean(cleanEmail && o.customerEmail && o.customerEmail.trim().toLowerCase() === cleanEmail);
-      const matchPhone = Boolean(cleanPhone && o.customerPhone && o.customerPhone.replace(/[^0-9]/g, '') === cleanPhone);
-
-      if (matchEmail || matchPhone) {
-        // Link to user if was unassigned
-        if (userId && !o.userId) {
-          o.userId = userId;
-          hasUpdates = true;
-        }
-        return true;
-      }
-      return matchId;
-    });
-
-    if (hasUpdates) {
-      saveStoredOrders(all);
-    }
-
-    return userOrders;
+    return mergeOrders(cloudOrders, migrated, localOrders, supabaseOrders);
   },
 
   async getAllOrders(): Promise<Order[]> {
+    try {
+      const snapshot = await getDocs(query(collection(db, 'orders'), orderBy('createdAt', 'desc')));
+      if (snapshot.docs.length) return snapshot.docs.map(item => orderFromFirestore(item.data()));
+    } catch (error) {
+      console.warn('Firestore fetch all orders fallback:', error);
+    }
     if (isSupabaseConfigured) {
       try {
-        const { data, error } = await supabase
-          .from('orders')
-          .select('*')
-          .order('created_at', { ascending: false });
-
-        if (!error && data && data.length > 0) {
-          return data.map((o: any) => ({
-            id: o.id,
-            orderNumber: o.order_number,
-            userId: o.user_id,
-            customerName: o.customer_name,
-            customerPhone: o.customer_phone,
-            customerEmail: o.customer_email,
-            shippingAddress: o.shipping_address,
-            district: o.district,
-            city: o.city,
-            province: o.province,
-            postalCode: o.postal_code,
-            notes: o.notes,
-            shippingMethod: o.shipping_method,
-            shippingCost: o.shipping_cost,
-            subtotal: o.subtotal,
-            grandTotal: o.grand_total,
-            status: o.status as OrderStatus,
-            items: o.items || [],
-            whatsappText: o.whatsapp_text,
-            snapToken: o.snap_token || o.snapToken || '',
-            snapRedirectUrl: o.snap_redirect_url || o.snapRedirectUrl || '',
-            paymentMethod: o.payment_method || 'Midtrans',
-            createdAt: o.created_at
-          }));
-        }
-      } catch (err) {
-        console.warn('Supabase fetch all orders error:', err);
+        const { data, error } = await supabase.from('orders').select('*').order('created_at', { ascending: false });
+        if (!error && data) return data.map(mapSupabaseOrder);
+      } catch (error) {
+        console.warn('Supabase fetch all orders error:', error);
       }
     }
-
     return getStoredOrders();
   },
 
@@ -263,94 +282,62 @@ Halo Admin Daily Thread, saya ingin mengonfirmasi pesanan di atas. Mohon info no
     return this.updateOrderFulfillment(orderId, { status });
   },
 
-  async updateOrderFulfillment(
-    orderId: string, 
-    payload: {
-      status: OrderStatus;
-      trackingNumber?: string;
-      courier?: string;
-      cancelReason?: string;
-    }
-  ): Promise<Order | null> {
+  async updateOrderFulfillment(orderId: string, payload: { status: OrderStatus; trackingNumber?: string; courier?: string; cancelReason?: string }): Promise<Order | null> {
+    const updateData: Record<string, unknown> = { status: payload.status };
+    if (payload.trackingNumber) updateData.trackingNumber = payload.trackingNumber;
+    if (payload.courier) updateData.courier = payload.courier;
+    if (payload.cancelReason) updateData.cancelReason = payload.cancelReason;
+    if (payload.status === 'Shipped') updateData.shippedAt = new Date().toISOString();
+    if (payload.status === 'Completed') updateData.completedAt = new Date().toISOString();
+
+    try { await updateDoc(doc(db, 'orders', orderId), updateData); }
+    catch (error) { console.warn('Firestore order status update warning:', error); }
     if (isSupabaseConfigured) {
       try {
-        const updateData: any = { status: payload.status };
-        if (payload.trackingNumber) updateData.tracking_number = payload.trackingNumber;
-        if (payload.courier) updateData.courier = payload.courier;
-        await supabase
-          .from('orders')
-          .update(updateData)
-          .eq('id', orderId);
-      } catch (err) {
-        console.warn('Supabase update order fulfillment error:', err);
-      }
+        const supabaseData: any = { status: payload.status };
+        if (payload.trackingNumber) supabaseData.tracking_number = payload.trackingNumber;
+        if (payload.courier) supabaseData.courier = payload.courier;
+        await supabase.from('orders').update(supabaseData).eq('id', orderId);
+      } catch (error) { console.warn('Supabase update order fulfillment error:', error); }
     }
 
     const orders = getStoredOrders();
-    const idx = orders.findIndex(o => o.id === orderId);
-    if (idx !== -1) {
-      const order = orders[idx];
-      order.status = payload.status;
-      if (payload.trackingNumber) order.trackingNumber = payload.trackingNumber;
-      if (payload.courier) order.courier = payload.courier;
-      if (payload.cancelReason) order.cancelReason = payload.cancelReason;
-      
-      if (payload.status === 'Shipped') {
-        order.shippedAt = order.shippedAt || new Date().toISOString();
-      }
-      if (payload.status === 'Completed') {
-        order.completedAt = order.completedAt || new Date().toISOString();
-      }
-      
-      saveStoredOrders(orders);
-      return order;
-    }
-    return null;
+    const index = orders.findIndex(order => order.id === orderId);
+    if (index === -1) return null;
+    const updated = { ...orders[index], ...payload } as Order;
+    if (payload.status === 'Shipped') updated.shippedAt = updated.shippedAt || new Date().toISOString();
+    if (payload.status === 'Completed') updated.completedAt = updated.completedAt || new Date().toISOString();
+    orders[index] = updated;
+    saveStoredOrders(orders);
+    return updated;
   },
 
   async markOrderAsPaid(orderId: string, paymentMethod = 'Midtrans'): Promise<Order | null> {
-    const orders = getStoredOrders();
-    const idx = orders.findIndex(o => o.id === orderId);
-    if (idx !== -1) {
-      orders[idx].status = 'Sudah Bayar';
-      orders[idx].paymentMethod = paymentMethod;
-      orders[idx].paymentTime = new Date().toISOString();
-      saveStoredOrders(orders);
-
-      if (isSupabaseConfigured) {
-        try {
-          await supabase
-            .from('orders')
-            .update({
-              status: 'Sudah Bayar',
-              payment_method: paymentMethod,
-              payment_time: orders[idx].paymentTime
-            })
-            .eq('id', orderId);
-        } catch (err) {
-          console.warn('Supabase mark order paid error:', err);
-        }
-      }
-      return orders[idx];
+    const paymentTime = new Date().toISOString();
+    try { await updateDoc(doc(db, 'orders', orderId), { status: 'Sudah Bayar', paymentMethod, paymentTime }); }
+    catch (error) { console.warn('Firestore mark order paid warning:', error); }
+    if (isSupabaseConfigured) {
+      try { await supabase.from('orders').update({ status: 'Sudah Bayar', payment_method: paymentMethod, payment_time: paymentTime }).eq('id', orderId); }
+      catch (error) { console.warn('Supabase mark order paid error:', error); }
     }
-    return null;
+    const orders = getStoredOrders();
+    const index = orders.findIndex(order => order.id === orderId);
+    if (index === -1) return null;
+    orders[index] = { ...orders[index], status: 'Sudah Bayar', paymentMethod, paymentTime };
+    saveStoredOrders(orders);
+    return orders[index];
   },
 
   async cancelOrder(orderId: string, reason = 'Dibatalkan oleh pembeli'): Promise<Order | null> {
-    return this.updateOrderFulfillment(orderId, {
-      status: 'Dibatalkan',
-      cancelReason: reason
-    });
+    return this.updateOrderFulfillment(orderId, { status: 'Dibatalkan', cancelReason: reason });
   },
 
   async markOrderAsExpired(orderId: string): Promise<Order | null> {
-    return this.updateOrderFulfillment(orderId, {
-      status: 'Kadaluarsa',
-      cancelReason: 'Batas waktu pembayaran telah habis (24 jam)'
-    });
+    return this.updateOrderFulfillment(orderId, { status: 'Kadaluarsa', cancelReason: 'Batas waktu pembayaran telah habis (24 jam)' });
   },
 
   resetOrders(): void {
+    // Retained for the existing admin control; normal synchronization never calls this.
     saveStoredOrders([]);
   }
 };
