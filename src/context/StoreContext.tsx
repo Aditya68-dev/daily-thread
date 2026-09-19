@@ -1,4 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
+import { onAuthStateChanged } from 'firebase/auth';
+import { auth } from '../auth.js';
 import { 
   Product, 
   Category, 
@@ -17,7 +19,7 @@ import { orderService } from '../services/orderService.ts';
 import { notificationService } from '../services/notificationService.ts';
 import { midtransService } from '../services/midtransService.ts';
 
-export type ViewState = 
+export type ViewState =
   | 'home' 
   | 'shop' 
   | 'product-detail' 
@@ -69,7 +71,6 @@ interface StoreContextType {
   brandFilter: string;
   setBrandFilter: (brand: string) => void;
 
-  // Actions
   login: (email: string, password: string) => Promise<boolean>;
   register: (payload: any) => Promise<boolean>;
   logout: () => Promise<void>;
@@ -123,23 +124,47 @@ export const StoreProvider: React.FC<{ children: ReactNode }> = ({ children }) =
   const addToast = (type: 'success' | 'error' | 'info', title: string, message: string) => {
     const id = `toast-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
     setToasts(prev => [...prev, { id, type, title, message }]);
-    setTimeout(() => {
-      removeToast(id);
-    }, 4500);
+    setTimeout(() => removeToast(id), 4500);
   };
 
   const removeToast = (id: string) => {
     setToasts(prev => prev.filter(t => t.id !== id));
   };
 
-  // Load Config, Categories, Brands on mount
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (firebaseUser) => {
+      if (firebaseUser) {
+        const normalizedUser: User = {
+          id: firebaseUser.uid,
+          fullName: firebaseUser.displayName || firebaseUser.email?.split('@')[0] || 'User',
+          username: (firebaseUser.displayName || firebaseUser.email || 'user').toLowerCase().replace(/\s+/g, '_') || `user-${firebaseUser.uid.slice(0, 8)}`,
+          email: firebaseUser.email || '',
+          phone: firebaseUser.phoneNumber || '',
+          avatar: firebaseUser.photoURL || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?q=80&w=150&auto=format&fit=crop',
+          role: 'user',
+          status: 'active',
+          createdAt: firebaseUser.metadata?.creationTime || new Date().toISOString()
+        };
+        setUser(normalizedUser);
+        setToken(firebaseUser.uid);
+        localStorage.setItem('dt_current_user', JSON.stringify(normalizedUser));
+        localStorage.setItem('dt_token', firebaseUser.uid);
+      } else {
+        setUser(null);
+        setToken(null);
+        localStorage.removeItem('dt_current_user');
+        localStorage.removeItem('dt_token');
+      }
+    });
+
+    return () => unsubscribe();
+  }, []);
+
   useEffect(() => {
     setStoreConfig(productService.getStoreConfig());
-
     productService.getCategories().then(setCategories).catch(console.error);
     productService.getBrands().then(setBrands).catch(console.error);
 
-    // Initial session check
     authService.getInitialSession().then(({ user: authUser, token: authToken }) => {
       if (authUser && authToken) {
         setUser(authUser);
@@ -148,7 +173,6 @@ export const StoreProvider: React.FC<{ children: ReactNode }> = ({ children }) =
     });
   }, []);
 
-  // Fetch Cart, Wishlist, Notifications when user or token changes
   useEffect(() => {
     fetchCart();
     fetchWishlist();
@@ -188,7 +212,6 @@ export const StoreProvider: React.FC<{ children: ReactNode }> = ({ children }) =
       setToken(result.token);
       setUser(result.user);
       setAuthModalOpen(false);
-
       if (result.user.role === 'admin') {
         setActiveView('admin');
         addToast('success', 'Pusat Kontrol Administrator', `Selamat datang, ${result.user.fullName}! Dialihkan ke Pusat Kontrol Penjualan & Pesanan.`);
@@ -337,50 +360,33 @@ export const StoreProvider: React.FC<{ children: ReactNode }> = ({ children }) =
     }
   };
 
-  const isInWishlist = (productId: string): boolean => {
-    return wishlist.some(item => item.productId === productId);
-  };
+  const isInWishlist = (productId: string): boolean => wishlist.some(item => item.productId === productId);
 
   const createOrder = async (orderData: any) => {
     try {
-      // Calculate order totals from cart items safely
       const subtotal = cart.reduce((acc, item) => acc + ((Number(item.price) || 0) * (Number(item.quantity) || 0)), 0);
       const grandTotal = subtotal + (Number(orderData.shippingCost) || 0);
 
-      const items = cart.map(item => {
-        const itemPrice = Number(item.price) || 0;
-        const itemQty = Number(item.quantity) || 1;
-        return {
-          productId: item.productId,
-          name: item.name || 'Produk',
-          brand: item.brand || 'Daily Thread',
-          price: itemPrice,
-          size: item.size || 'M',
-          color: item.color || 'Default',
-          quantity: itemQty,
-          subtotal: itemPrice * itemQty,
-          image: item.image || 'https://images.unsplash.com/photo-1542272604-780c96856592?q=80&w=800&auto=format&fit=crop'
-        };
-      });
+      const items = cart.map(item => ({
+        productId: item.productId,
+        name: item.name || 'Produk',
+        brand: item.brand || 'Daily Thread',
+        price: Number(item.price) || 0,
+        size: item.size || 'M',
+        color: item.color || 'Default',
+        quantity: Number(item.quantity) || 1,
+        subtotal: (Number(item.price) || 0) * (Number(item.quantity) || 1),
+        image: item.image || 'https://images.unsplash.com/photo-1542272604-780c96856592?q=80&w=800&auto=format&fit=crop'
+      }));
 
       const finalOrderNumber = orderData.orderNumber || `DT-ORD-${Date.now()}`;
-      const fullOrderPayload = {
-        ...orderData,
-        orderNumber: finalOrderNumber,
-        subtotal,
-        grandTotal,
-        items
-      };
-
-      // Request Midtrans Snap Transaction Token
+      const fullOrderPayload = { ...orderData, orderNumber: finalOrderNumber, subtotal, grandTotal, items };
       const midtransRes = await midtransService.createTransaction(fullOrderPayload as any);
-
       fullOrderPayload.snapToken = midtransRes.token;
       fullOrderPayload.snapRedirectUrl = midtransRes.redirect_url;
 
       const result = await orderService.createOrder(fullOrderPayload, user?.id);
 
-      // If user is logged in, auto-save shipping address and phone to their profile if not yet set
       if (user && (!user.phone || !user.address)) {
         try {
           await authService.updateProfile(user.id, {
@@ -406,7 +412,6 @@ export const StoreProvider: React.FC<{ children: ReactNode }> = ({ children }) =
       await cartService.clearCart(user?.id);
       setCart([]);
 
-      // Auto-create notification for new order
       try {
         await notificationService.addNotification({
           title: `Pesanan Baru: #${finalOrderNumber}`,
