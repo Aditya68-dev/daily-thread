@@ -1,0 +1,9 @@
+export { HomeView as HomePage } from '../components/HomeView.tsx';
+export { ShopView as ShopPage } from '../components/ShopView.tsx';
+export { ProductDetailView as ProductDetailPage } from '../components/ProductDetailView.tsx';
+export { CartView as CartPage } from '../components/CartView.tsx';
+export { CheckoutView as CheckoutPage } from '../components/CheckoutView.tsx';
+export { ProfileView as ProfilePage } from '../components/ProfileView.tsx';
+export { OrdersView as OrdersPage } from '../components/OrdersView.tsx';
+export { WishlistView as WishlistPage } from '../components/WishlistView.tsx';
+export { AdminDashboard as AdminPage } from '../components/AdminDashboard.tsx';
