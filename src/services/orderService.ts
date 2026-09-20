@@ -1,4 +1,3 @@
-import { supabase, isSupabaseConfigured } from '../lib/supabase.ts';
 import { db } from '../firebase.js';
 import {
   collection,
@@ -18,8 +17,6 @@ const RESET_FLAG_KEY = 'dt_orders_reset_fresh_v3';
 
 function getStoredOrders(): Order[] {
   try {
-    // Never clear existing local orders merely because this browser has no flag yet.
-    // The flag is retained for backward compatibility with older installations.
     if (localStorage.getItem(RESET_FLAG_KEY) !== 'true') {
       localStorage.setItem(RESET_FLAG_KEY, 'true');
     }
@@ -28,8 +25,8 @@ function getStoredOrders(): Order[] {
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) return parsed;
     }
-  } catch (e) {
-    console.error('Failed to read local orders:', e);
+  } catch (error) {
+    console.error('Failed to read local orders:', error);
   }
   return [];
 }
@@ -37,15 +34,15 @@ function getStoredOrders(): Order[] {
 function saveStoredOrders(orders: Order[]) {
   try {
     localStorage.setItem(LOCAL_ORDERS_KEY, JSON.stringify(orders));
-  } catch (e) {
-    console.error('Failed to save local orders:', e);
+  } catch (error) {
+    console.error('Failed to save local orders:', error);
   }
 }
 
-function orderFromFirestore(data: any): Order {
+function orderFromFirestore(data: any, documentId?: string): Order {
   return {
     ...data,
-    id: data.id,
+    id: data.id || documentId,
     userId: data.userId,
     orderNumber: data.orderNumber,
     items: data.items || [],
@@ -57,12 +54,20 @@ function orderFromFirestore(data: any): Order {
 }
 
 function orderToFirestore(order: Order): Record<string, unknown> {
-  // The UID is deliberately stored in the document, not inferred from email/phone.
   return { ...order, userId: order.userId };
 }
 
 async function saveOrderToFirestore(order: Order): Promise<void> {
-  await setDoc(doc(db, 'orders', order.id), orderToFirestore(order), { merge: false });
+  if (!order.userId) {
+    throw new Error('Cannot write order to Firestore without a Firebase Auth UID.');
+  }
+
+  try {
+    await setDoc(doc(db, 'orders', order.id), orderToFirestore(order), { merge: false });
+  } catch (error) {
+    console.error('Firestore order write failed:', error);
+    throw error;
+  }
 }
 
 async function migrateLocalOrders(userId: string, userEmail?: string): Promise<Order[]> {
@@ -76,13 +81,12 @@ async function migrateLocalOrders(userId: string, userEmail?: string): Promise<O
   for (const order of eligible) {
     const migratedOrder = { ...order, userId };
     try {
-      // setDoc with merge preserves any cloud fields already present and is idempotent.
       await setDoc(doc(db, 'orders', order.id), orderToFirestore(migratedOrder), { merge: true });
     } catch (error) {
-      console.warn(`Firestore migration skipped for order ${order.id}:`, error);
+      console.error(`Firestore migration failed for order ${order.id}:`, error);
     }
   }
-  // Do not remove or rewrite local orders during migration.
+
   return eligible.map(order => order.userId === userId ? order : { ...order, userId });
 }
 
@@ -94,37 +98,6 @@ function mergeOrders(...lists: Order[][]): Order[] {
   return [...byId.values()].sort((a, b) =>
     new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
   );
-}
-
-function mapSupabaseOrder(o: any): Order {
-  return {
-    id: o.id,
-    orderNumber: o.order_number,
-    userId: o.user_id,
-    customerName: o.customer_name,
-    customerPhone: o.customer_phone,
-    customerEmail: o.customer_email,
-    shippingAddress: o.shipping_address,
-    district: o.district,
-    city: o.city,
-    province: o.province,
-    postalCode: o.postal_code,
-    notes: o.notes,
-    shippingMethod: o.shipping_method,
-    shippingCost: o.shipping_cost,
-    subtotal: o.subtotal,
-    grandTotal: o.grand_total,
-    status: o.status as OrderStatus,
-    items: o.items || [],
-    whatsappText: o.whatsapp_text,
-    snapToken: o.snap_token || o.snapToken || '',
-    snapRedirectUrl: o.snap_redirect_url || o.snapRedirectUrl || '',
-    paymentMethod: o.payment_method || 'Midtrans',
-    paymentTime: o.payment_time,
-    trackingNumber: o.tracking_number,
-    courier: o.courier,
-    createdAt: o.created_at
-  };
 }
 
 export const orderService = {
@@ -197,38 +170,18 @@ Halo Admin Daily Thread, saya ingin mengonfirmasi pesanan di atas. Mohon info no
     const cleanPhone = String(config.whatsappNumber).replace(/[^0-9]/g, '');
     const whatsappUrl = `https://wa.me/${cleanPhone}?text=${encodeURIComponent(newOrder.whatsappText)}`;
 
-    try {
-      await saveOrderToFirestore(newOrder);
-    } catch (error) {
-      console.warn('Firestore order insert warning; retaining local fallback:', error);
-    }
+    // Orders are persisted in Firestore only. Supabase is intentionally not used here.
+    await saveOrderToFirestore(newOrder);
 
-    if (isSupabaseConfigured) {
-      try {
-        const { error } = await supabase.from('orders').insert({
-          id: newOrder.id, order_number: newOrder.orderNumber, user_id: userId,
-          customer_name: newOrder.customerName, customer_phone: newOrder.customerPhone,
-          customer_email: newOrder.customerEmail, shipping_address: newOrder.shippingAddress,
-          district: newOrder.district, city: newOrder.city, province: newOrder.province,
-          postal_code: newOrder.postalCode, notes: newOrder.notes,
-          shipping_method: newOrder.shippingMethod, shipping_cost: newOrder.shippingCost,
-          subtotal: newOrder.subtotal, grand_total: newOrder.grandTotal, status: newOrder.status,
-          whatsapp_text: newOrder.whatsappText, snap_token: newOrder.snapToken,
-          snap_redirect_url: newOrder.snapRedirectUrl, items: newOrder.items
-        });
-        if (error) console.warn('Supabase order insert warning:', error);
-      } catch (err) {
-        console.warn('Supabase createOrder error, saved locally:', err);
-      }
-    }
-
+    // Keep localStorage only as an offline/migration fallback after the primary write.
     const orders = getStoredOrders();
     saveStoredOrders([newOrder, ...orders.filter(o => o.id !== newOrder.id && o.orderNumber !== newOrder.orderNumber)]);
     return { order: newOrder, whatsappUrl };
   },
 
-  async getUserOrders(userId?: string, userEmail?: string, userPhone?: string): Promise<Order[]> {
+  async getUserOrders(userId?: string, userEmail?: string, _userPhone?: string): Promise<Order[]> {
     if (!userId) return [];
+
     let cloudOrders: Order[] = [];
     try {
       const snapshot = await getDocs(query(
@@ -236,9 +189,9 @@ Halo Admin Daily Thread, saya ingin mengonfirmasi pesanan di atas. Mohon info no
         where('userId', '==', userId),
         orderBy('createdAt', 'desc')
       ));
-      cloudOrders = snapshot.docs.map(item => orderFromFirestore(item.data()));
+      cloudOrders = snapshot.docs.map(item => orderFromFirestore(item.data(), item.id));
     } catch (error) {
-      console.warn('Firestore fetch user orders fallback:', error);
+      console.error(`Firestore read failed for orders belonging to UID ${userId}:`, error);
     }
 
     const migrated = await migrateLocalOrders(userId, userEmail);
@@ -247,35 +200,17 @@ Halo Admin Daily Thread, saya ingin mengonfirmasi pesanan di atas. Mohon info no
       (!order.userId && userEmail && order.customerEmail?.trim().toLowerCase() === userEmail.trim().toLowerCase())
     );
 
-    // Supabase remains a compatibility source, but Firebase UID is the primary key.
-    let supabaseOrders: Order[] = [];
-    if (isSupabaseConfigured) {
-      try {
-        const { data, error } = await supabase.from('orders').select('*').eq('user_id', userId).order('created_at', { ascending: false });
-        if (!error && data) supabaseOrders = data.map(mapSupabaseOrder);
-      } catch (error) {
-        console.warn('Supabase fetch user orders fallback:', error);
-      }
-    }
-    return mergeOrders(cloudOrders, migrated, localOrders, supabaseOrders);
+    return mergeOrders(cloudOrders, migrated, localOrders);
   },
 
   async getAllOrders(): Promise<Order[]> {
     try {
       const snapshot = await getDocs(query(collection(db, 'orders'), orderBy('createdAt', 'desc')));
-      if (snapshot.docs.length) return snapshot.docs.map(item => orderFromFirestore(item.data()));
+      return snapshot.docs.map(item => orderFromFirestore(item.data(), item.id));
     } catch (error) {
-      console.warn('Firestore fetch all orders fallback:', error);
+      console.error('Firestore read failed for all orders:', error);
+      return getStoredOrders();
     }
-    if (isSupabaseConfigured) {
-      try {
-        const { data, error } = await supabase.from('orders').select('*').order('created_at', { ascending: false });
-        if (!error && data) return data.map(mapSupabaseOrder);
-      } catch (error) {
-        console.warn('Supabase fetch all orders error:', error);
-      }
-    }
-    return getStoredOrders();
   },
 
   async updateOrderStatus(orderId: string, status: OrderStatus): Promise<Order | null> {
@@ -290,15 +225,10 @@ Halo Admin Daily Thread, saya ingin mengonfirmasi pesanan di atas. Mohon info no
     if (payload.status === 'Shipped') updateData.shippedAt = new Date().toISOString();
     if (payload.status === 'Completed') updateData.completedAt = new Date().toISOString();
 
-    try { await updateDoc(doc(db, 'orders', orderId), updateData); }
-    catch (error) { console.warn('Firestore order status update warning:', error); }
-    if (isSupabaseConfigured) {
-      try {
-        const supabaseData: any = { status: payload.status };
-        if (payload.trackingNumber) supabaseData.tracking_number = payload.trackingNumber;
-        if (payload.courier) supabaseData.courier = payload.courier;
-        await supabase.from('orders').update(supabaseData).eq('id', orderId);
-      } catch (error) { console.warn('Supabase update order fulfillment error:', error); }
+    try {
+      await updateDoc(doc(db, 'orders', orderId), updateData);
+    } catch (error) {
+      console.error(`Firestore order status update failed for ${orderId}:`, error);
     }
 
     const orders = getStoredOrders();
@@ -314,12 +244,12 @@ Halo Admin Daily Thread, saya ingin mengonfirmasi pesanan di atas. Mohon info no
 
   async markOrderAsPaid(orderId: string, paymentMethod = 'Midtrans'): Promise<Order | null> {
     const paymentTime = new Date().toISOString();
-    try { await updateDoc(doc(db, 'orders', orderId), { status: 'Sudah Bayar', paymentMethod, paymentTime }); }
-    catch (error) { console.warn('Firestore mark order paid warning:', error); }
-    if (isSupabaseConfigured) {
-      try { await supabase.from('orders').update({ status: 'Sudah Bayar', payment_method: paymentMethod, payment_time: paymentTime }).eq('id', orderId); }
-      catch (error) { console.warn('Supabase mark order paid error:', error); }
+    try {
+      await updateDoc(doc(db, 'orders', orderId), { status: 'Sudah Bayar', paymentMethod, paymentTime });
+    } catch (error) {
+      console.error(`Firestore payment update failed for ${orderId}:`, error);
     }
+
     const orders = getStoredOrders();
     const index = orders.findIndex(order => order.id === orderId);
     if (index === -1) return null;
@@ -337,7 +267,6 @@ Halo Admin Daily Thread, saya ingin mengonfirmasi pesanan di atas. Mohon info no
   },
 
   resetOrders(): void {
-    // Retained for the existing admin control; normal synchronization never calls this.
     saveStoredOrders([]);
   }
 };
